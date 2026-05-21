@@ -1,4 +1,49 @@
 import { attach, Neovim } from 'neovim';
+import { existsSync, statSync } from 'node:fs';
+import { dirname, join, parse } from 'node:path';
+import { createConnection } from 'node:net';
+
+const SOCKET_FILENAME = '.nvim-mcp.sock';
+
+async function probeSocket(path: string, timeoutMs = 200): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = createConnection(path);
+    let done = false;
+    const finish = (alive: boolean) => {
+      if (done) return;
+      done = true;
+      sock.removeAllListeners();
+      sock.destroy();
+      resolve(alive);
+    };
+    sock.once('connect', () => finish(true));
+    sock.once('error', () => finish(false));
+    setTimeout(() => finish(false), timeoutMs);
+  });
+}
+
+async function discoverSocketPath(startDir: string): Promise<string | null> {
+  let dir = startDir;
+  const root = parse(dir).root;
+  while (true) {
+    const candidate = join(dir, SOCKET_FILENAME);
+    if (existsSync(candidate)) {
+      let isSocket = false;
+      try {
+        isSocket = statSync(candidate).isSocket();
+      } catch {
+        // stat may fail on dangling links; treat as non-socket and keep walking
+      }
+      if (isSocket && await probeSocket(candidate)) {
+        return candidate;
+      }
+    }
+    if (dir === root) return null;
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
 
 export class NeovimConnectionError extends Error {
   constructor(socketPath: string, cause?: Error) {
@@ -92,9 +137,18 @@ export class NeovimManager {
   }
 
   private async connect(): Promise<Neovim> {
-    const socketPath = process.env.NVIM_SOCKET_PATH || '/tmp/nvim';
+    let socketPath = process.env.NVIM_SOCKET_PATH;
+    if (!socketPath) {
+      const found = await discoverSocketPath(process.cwd());
+      if (!found) {
+        throw new NeovimConnectionError(
+          `${SOCKET_FILENAME} (searched ${process.cwd()} and parents)`
+        );
+      }
+      socketPath = found;
+    }
     this.validateSocketPath(socketPath);
-    
+
     try {
       return attach({
         socket: socketPath
